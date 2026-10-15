@@ -1,0 +1,40 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache e bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Modelos binários (baixados via script)
+*.task
+edge/vguard/vision/models/*.task
+!edge/vguard/vision/models/.gitkeep
+
+# IDEs e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Dados capturados, mídias e telemetria (conforme política do V-GUARD)
+# Mantém preservadas as imagens da documentação em docs/
+captures/
+recordings/
+logs/
+*.log
+*.sqlite3
+*.db
+*.mp4
+*.avi
+*.mkv
+*.h264
+*.webm

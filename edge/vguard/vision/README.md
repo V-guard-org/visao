@@ -30,11 +30,14 @@ python3 --version
 
 ### Estrutura do projeto
 ```
-vguard-vision/
+edge/vguard/vision/
 │
 ├── main.py
 ├── requirements.txt
 ├── README.md
+│
+├── scripts/
+│   └── download_model.py
 │
 └── models/
     └── face_landmarker.task
@@ -45,7 +48,9 @@ vguard-vision/
 
 Clone o projeto ou entre na pasta do módulo:
 
-cd vguard-vision
+```bash
+cd edge/vguard/vision
+```
 
 Crie o ambiente virtual:
 
@@ -92,19 +97,25 @@ numpy==2.1.3
 ```
 #### 5. Modelo do MediaPipe
 
-O projeto utiliza o modelo face_landmarker.task.
+O projeto utiliza o modelo `face_landmarker.task` localizado em `models/face_landmarker.task`.
 
-O arquivo deve estar localizado em:
+Para baixá-lo automaticamente através do script utilitário:
+```bash
+python scripts/download_model.py
 ```
-models/face_landmarker.task
-```
+
+O script criará o diretório `models/` e fará o download do modelo oficial do MediaPipe.
+
 Estrutura esperada:
 ```
-vguard-vision/
+edge/vguard/vision/
 │
 ├── main.py
 ├── requirements.txt
 ├── README.md
+│
+├── scripts/
+│   └── download_model.py
 │
 └── models/
     └── face_landmarker.task

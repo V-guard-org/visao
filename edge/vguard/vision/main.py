@@ -3,6 +3,7 @@ import numpy as np
 import mediapipe as mp
 import math
 import time
+from pathlib import Path
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -12,7 +13,13 @@ from mediapipe.tasks.python import vision
 # CONFIGURAÇÃO
 # ============================================================
 
-MODEL_PATH = "models/face_landmarker.task"
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = str(BASE_DIR / "models" / "face_landmarker.task")
+
+if not Path(MODEL_PATH).exists():
+    print(f"Erro: Modelo não encontrado em '{MODEL_PATH}'.")
+    print("Execute 'python scripts/download_model.py' para baixar o modelo.")
+    exit(1)
 
 # Limiares INICIAIS.
 # NÃO são valores definitivos do V-GUARD.
