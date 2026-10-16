@@ -1,446 +1,449 @@
-import cv2
-import numpy as np
-import mediapipe as mp
-import math
+"""
+V-GUARD - Modulo de Visao Computacional (Orquestrador Principal).
+
+Pipeline de execucao:
+1. Captura de quadros da camera / arquivo de video (resolucao padrao 640x480).
+2. Deteccao de landmarks faciais via MediaPipe Face Landmarker (timestamps monotonicos reais).
+3. Extracao de metricas geometricas puras (EAR, MAR e Head Pose via solvePnP) com metrics.py.
+4. Analise temporal e maquina de estados do condutor via detector.py.
+5. Invocacao do EventManager do V-GUARD (com codificacao JPEG em memoria) sob demanda.
+6. Interface grafica opcional (--debug / modo visual) com suporte a execucao headless no Raspberry Pi.
+"""
+
+import argparse
+import sys
 import time
 from pathlib import Path
+from typing import Any, Optional, Union
 
+import cv2
+import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+# Garante resolucao de imports locais do modulo
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = str(BASE_DIR / "models" / "face_landmarker.task")
-
-if not Path(MODEL_PATH).exists():
-    print(f"Erro: Modelo não encontrado em '{MODEL_PATH}'.")
-    print("Execute 'python scripts/download_model.py' para baixar o modelo.")
-    exit(1)
-
-# Limiares INICIAIS.
-# NÃO são valores definitivos do V-GUARD.
-EAR_THRESHOLD = 0.22
-MAR_THRESHOLD = 0.60
-
-# Quantidade de tempo que os olhos precisam permanecer
-# fechados para considerarmos "olhos fechados prolongadamente".
-EYES_CLOSED_TIME = 1.0
+from config import (
+    FRAME_HEIGHT,
+    FRAME_WIDTH,
+    LEFT_EYE_INDICES,
+    MIN_FACE_DETECTION_CONFIDENCE,
+    MIN_FACE_PRESENCE_CONFIDENCE,
+    MIN_TRACKING_CONFIDENCE,
+    MODEL_PATH,
+    MOUTH_INDICES,
+    RIGHT_EYE_INDICES,
+)
+from detector import DetectionResult, DriverStateDetector
+from metrics import FrameMetrics, extract_all_metrics, to_pixel_coords
 
 
-# ============================================================
-# LANDMARKS
-# ============================================================
+# ==============================================================================
+# 1. RENDERIZAÇÃO DE OVERLAY GRÁFICO (MODO DEBUG VISUAL)
+# ==============================================================================
 
-# Olho direito da pessoa
-RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-
-# Olho esquerdo da pessoa
-LEFT_EYE = [362, 385, 387, 263, 373, 380]
-
-# Boca
-MOUTH_LEFT = 61
-MOUTH_RIGHT = 291
-MOUTH_TOP = 13
-MOUTH_BOTTOM = 14
+def draw_landmarks(frame: np.ndarray, landmarks: Any, width: int, height: int) -> None:
+    """Desenha os pontos-chave faciais (olhos, boca e nariz) sobre o frame."""
+    key_indices = RIGHT_EYE_INDICES + LEFT_EYE_INDICES + MOUTH_INDICES + [1]
+    for idx in key_indices:
+        px, py = to_pixel_coords(landmarks[idx], width, height)
+        cv2.circle(frame, (int(px), int(py)), 2, (0, 255, 0), -1)
 
 
-# ============================================================
-# FUNÇÕES GEOMÉTRICAS
-# ============================================================
+def draw_hud(
+    frame: np.ndarray,
+    metrics: Optional[FrameMetrics],
+    detection: DetectionResult,
+    fps: float,
+    alert_text: Optional[str] = None,
+) -> None:
+    """Desenha o painel de telemetria HUD e alertas sobre o frame."""
+    h, w = frame.shape[:2]
 
-def distance(p1, p2):
-    """
-    Distância euclidiana entre dois pontos 2D.
-    """
-    return math.sqrt(
-        (p1.x - p2.x) ** 2 +
-        (p1.y - p2.y) ** 2
-    )
+    # Painel semi-transparente no canto superior esquerdo
+    panel_w, panel_h = 280, 200
+    sub_img = frame[10 : 10 + panel_h, 10 : 10 + panel_w]
+    dark_rect = np.zeros(sub_img.shape, dtype=np.uint8)
+    res = cv2.addWeighted(sub_img, 0.4, dark_rect, 0.6, 1.0)
+    frame[10 : 10 + panel_h, 10 : 10 + panel_w] = res
+    cv2.rectangle(frame, (10, 10), (10 + panel_w, 10 + panel_h), (80, 80, 80), 1)
 
+    # Cores de estado
+    state_colors = {
+        "NORMAL": (0, 255, 0),       # Verde
+        "PISCANDO": (255, 255, 0),    # Ciano
+        "BOCEJANDO": (0, 255, 255),   # Amarelo
+        "FADIGA": (0, 0, 255),        # Vermelho
+        "DISTRAIDO": (0, 0, 255),     # Vermelho
+        "SEM_ROSTO": (0, 140, 255),   # Laranja
+    }
+    state_color = state_colors.get(detection.driver_state, (255, 255, 255))
 
-def calculate_ear(landmarks, eye_indices):
-    """
-    Calcula o Eye Aspect Ratio (EAR).
-
-    Pontos:
-
-          p2 ----- p3
-        /             \
-       p1               p4
-        \             /
-          p6 ----- p5
-
-    EAR = (|p2-p6| + |p3-p5|)
-          ---------------------
-               2|p1-p4|
-    """
-
-    p1 = landmarks[eye_indices[0]]
-    p2 = landmarks[eye_indices[1]]
-    p3 = landmarks[eye_indices[2]]
-    p4 = landmarks[eye_indices[3]]
-    p5 = landmarks[eye_indices[4]]
-    p6 = landmarks[eye_indices[5]]
-
-    vertical_1 = distance(p2, p6)
-    vertical_2 = distance(p3, p5)
-
-    horizontal = distance(p1, p4)
-
-    if horizontal == 0:
-        return 0.0
-
-    ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-
-    return ear
-
-
-def calculate_mar(landmarks):
-    """
-    Calcula uma versão simples do Mouth Aspect Ratio.
-
-    MAR = distância vertical da boca /
-          distância horizontal da boca
-    """
-
-    left = landmarks[MOUTH_LEFT]
-    right = landmarks[MOUTH_RIGHT]
-
-    top = landmarks[MOUTH_TOP]
-    bottom = landmarks[MOUTH_BOTTOM]
-
-    horizontal = distance(left, right)
-    vertical = distance(top, bottom)
-
-    if horizontal == 0:
-        return 0.0
-
-    return vertical / horizontal
-
-
-# ============================================================
-# DESENHO
-# ============================================================
-
-def draw_point(frame, landmark, width, height):
-    """
-    Converte landmark normalizado para coordenadas da imagem.
-    """
-
-    x = int(landmark.x * width)
-    y = int(landmark.y * height)
-
-    cv2.circle(
+    y = 35
+    cv2.putText(
         frame,
-        (x, y),
+        f"Estado: {detection.driver_state}",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        state_color,
         2,
-        (0, 255, 0),
-        -1
     )
 
-
-def draw_selected_landmarks(frame, landmarks):
-    """
-    Desenha somente os landmarks utilizados pelo algoritmo.
-    """
-
-    height, width, _ = frame.shape
-
-    indices = (
-        RIGHT_EYE +
-        LEFT_EYE +
-        [
-            MOUTH_LEFT,
-            MOUTH_RIGHT,
-            MOUTH_TOP,
-            MOUTH_BOTTOM
-        ]
-    )
-
-    for index in indices:
-        draw_point(
+    y += 25
+    if metrics is not None:
+        cv2.putText(
             frame,
-            landmarks[index],
-            width,
-            height
+            f"EAR: {metrics.ear:.3f} (L:{metrics.ear_left:.2f} R:{metrics.ear_right:.2f})",
+            (20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (220, 220, 220),
+            1,
         )
-
-
-# ============================================================
-# CLASSIFICAÇÃO
-# ============================================================
-
-def classify_driver(ear, mar, eyes_closed_start):
-    """
-    Classificação extremamente simples.
-
-    Retorna:
-
-        NORMAL
-        OLHOS FECHADOS
-        BOCA ABERTA
-    """
-
-    now = time.time()
-
-    # Olhos fechados
-    if ear < EAR_THRESHOLD:
-
-        if eyes_closed_start is None:
-            eyes_closed_start = now
-
-        duration = now - eyes_closed_start
-
-        if duration >= EYES_CLOSED_TIME:
-            state = "OLHOS FECHADOS"
-
-        else:
-            state = "PISCANDO"
-
+        y += 20
+        cv2.putText(
+            frame,
+            f"MAR: {metrics.mar:.3f}",
+            (20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (220, 220, 220),
+            1,
+        )
+        y += 20
+        cv2.putText(
+            frame,
+            f"Pose: P:{metrics.pitch:+.1f} Y:{metrics.yaw:+.1f} R:{metrics.roll:+.1f}",
+            (20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (220, 220, 220),
+            1,
+        )
     else:
+        cv2.putText(
+            frame,
+            "Rosto nao detectado",
+            (20, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 140, 255),
+            1,
+        )
+        y += 40
 
-        eyes_closed_start = None
-        duration = 0
-
-        state = "NORMAL"
-
-    # Boca aberta
-    if mar > MAR_THRESHOLD:
-        mouth_state = "BOCA ABERTA"
-    else:
-        mouth_state = "BOCA NORMAL"
-
-    return state, mouth_state, eyes_closed_start
-
-
-# ============================================================
-# MEDIAPIPE
-# ============================================================
-
-base_options = python.BaseOptions(
-    model_asset_path=MODEL_PATH
-)
-
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-
-    running_mode=vision.RunningMode.VIDEO,
-
-    num_faces=1,
-
-    min_face_detection_confidence=0.5,
-
-    min_face_presence_confidence=0.5,
-
-    min_tracking_confidence=0.5
-)
-
-landmarker = vision.FaceLandmarker.create_from_options(
-    options
-)
-
-
-# ============================================================
-# CÂMERA
-# ============================================================
-
-cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    print("Erro: não foi possível abrir a câmera.")
-    exit()
-
-
-eyes_closed_start = None
-
-timestamp_ms = 0
-
-previous_time = time.time()
-
-
-# ============================================================
-# LOOP PRINCIPAL
-# ============================================================
-
-while True:
-
-    ret, frame = cap.read()
-
-    if not ret:
-        print("Erro ao capturar frame.")
-        break
-
-    # --------------------------------------------------------
-    # BGR -> RGB
-    # --------------------------------------------------------
-
-    rgb_frame = cv2.cvtColor(
+    y += 22
+    cv2.putText(
         frame,
-        cv2.COLOR_BGR2RGB
+        f"T. Olhos Fechados: {detection.eyes_closed_duration:.2f}s",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (180, 180, 180),
+        1,
     )
-
-    # MediaPipe Image
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=rgb_frame
+    y += 18
+    cv2.putText(
+        frame,
+        f"T. Bocejo: {detection.yawn_duration:.2f}s",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (180, 180, 180),
+        1,
     )
-
-    # Timestamp obrigatório para VIDEO mode
-    timestamp_ms += 33
-
-    result = landmarker.detect_for_video(
-        mp_image,
-        timestamp_ms
+    y += 18
+    cv2.putText(
+        frame,
+        f"T. Distracao: {detection.distraction_duration:.2f}s",
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (180, 180, 180),
+        1,
     )
-
-    # --------------------------------------------------------
-    # PROCESSAMENTO DA FACE
-    # --------------------------------------------------------
-
-    if result.face_landmarks:
-
-        landmarks = result.face_landmarks[0]
-
-        # EAR dos dois olhos
-        right_ear = calculate_ear(
-            landmarks,
-            RIGHT_EYE
-        )
-
-        left_ear = calculate_ear(
-            landmarks,
-            LEFT_EYE
-        )
-
-        # EAR médio
-        ear = (
-            right_ear +
-            left_ear
-        ) / 2.0
-
-        # MAR
-        mar = calculate_mar(
-            landmarks
-        )
-
-        # Classificação
-        eye_state, mouth_state, eyes_closed_start = classify_driver(
-            ear,
-            mar,
-            eyes_closed_start
-        )
-
-        # ----------------------------------------------------
-        # DESENHO
-        # ----------------------------------------------------
-
-        draw_selected_landmarks(
-            frame,
-            landmarks
-        )
-
-        # ----------------------------------------------------
-        # TEXTO
-        # ----------------------------------------------------
-
-        cv2.putText(
-            frame,
-            f"EAR: {ear:.3f}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"MAR: {mar:.3f}",
-            (20, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Olhos: {eye_state}",
-            (20, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            f"Boca: {mouth_state}",
-            (20, 145),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
-        )
-
-    else:
-
-        eyes_closed_start = None
-
-        cv2.putText(
-            frame,
-            "ROSTO NAO DETECTADO",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2
-        )
-
-    # --------------------------------------------------------
-    # FPS
-    # --------------------------------------------------------
-
-    current_time = time.time()
-
-    fps = 1.0 / (current_time - previous_time)
-
-    previous_time = current_time
-
+    y += 22
     cv2.putText(
         frame,
         f"FPS: {fps:.1f}",
-        (20, 180),
+        (20, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
+        0.5,
+        (0, 255, 128),
+        1,
     )
 
-    # --------------------------------------------------------
-    # MOSTRAR
-    # --------------------------------------------------------
+    # Banner de alerta em caso de evento recente
+    if alert_text:
+        banner_h = 40
+        cv2.rectangle(
+            frame,
+            (0, h - banner_h),
+            (w, h),
+            (0, 0, 200),
+            -1,
+        )
+        cv2.putText(
+            frame,
+            alert_text,
+            (20, h - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
 
-    cv2.imshow(
-        "V-GUARD - Visao Computacional",
-        frame
+
+# ==============================================================================
+# 2. CLASSE PRINCIPAL DO PIPELINE (VisionPipeline)
+# ==============================================================================
+
+class VisionPipeline:
+    """
+    Orquestrador do modulo de visao computacional do V-GUARD.
+    Executa a captura, inferencia de landmarks, calculo de metricas e despacho de eventos.
+    """
+
+    def __init__(
+        self,
+        event_manager: Any = None,
+        headless: bool = False,
+        source: Union[int, str] = 0,
+        model_path: Union[str, Path] = MODEL_PATH,
+        frame_width: int = FRAME_WIDTH,
+        frame_height: int = FRAME_HEIGHT,
+        max_frames: Optional[int] = None,
+    ):
+        self.event_manager = event_manager
+        self.headless = headless
+        self.source = source
+        self.model_path = Path(model_path)
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.max_frames = max_frames
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                f"Modelo nao encontrado em: {self.model_path}\n"
+                "Execute 'python scripts/download_model.py' para baixa-lo."
+            )
+
+        # Inicializa o detector temporal
+        self.detector = DriverStateDetector()
+
+        # Contador de eventos disparados durante a execucao
+        self.events_recorded_count = 0
+
+    def _init_landmarker(self) -> vision.FaceLandmarker:
+        """Inicializa e configura o FaceLandmarker do MediaPipe."""
+        base_options = python.BaseOptions(model_asset_path=str(self.model_path))
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=MIN_FACE_DETECTION_CONFIDENCE,
+            min_face_presence_confidence=MIN_FACE_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        )
+        return vision.FaceLandmarker.create_from_options(options)
+
+    def _open_capture(self) -> cv2.VideoCapture:
+        """Abre a captura de video pela webcam ou arquivo."""
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            raise RuntimeError(f"Nao foi possivel abrir a fonte de video: {self.source}")
+
+        # Tenta definir resolucao recomendada caso seja dispositivo de camera
+        if isinstance(self.source, int) or (
+            isinstance(self.source, str) and self.source.isdigit()
+        ):
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+
+        return cap
+
+    def run(self) -> int:
+        """
+        Executa o loop principal de processamento de video.
+        Retorna o numero total de eventos registrados durante a sessao.
+        """
+        cap = self._open_capture()
+        landmarker = self._init_landmarker()
+
+        print(f"[V-GUARD Vision] Iniciando pipeline (source={self.source}, headless={self.headless})...")
+
+        last_timestamp_ms = 0
+        prev_time = time.monotonic()
+        fps = 0.0
+        frame_count = 0
+
+        # Controle de exibicao do banner visual de alerta
+        alert_banner: Optional[str] = None
+        alert_banner_expire: float = 0.0
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("[V-GUARD Vision] Fim da transmissao de video ou erro de captura.")
+                    break
+
+                frame_count += 1
+                now_mono = time.monotonic()
+                h, w = frame.shape[:2]
+
+                # Calculo de FPS real
+                delta_t = now_mono - prev_time
+                if delta_t > 0:
+                    fps = 1.0 / delta_t
+                prev_time = now_mono
+
+                # Relogio rigorosamente crescente em milissegundos para o MediaPipe VIDEO mode
+                timestamp_ms = max(last_timestamp_ms + 1, int(now_mono * 1000))
+                last_timestamp_ms = timestamp_ms
+
+                # Conversao BGR -> RGB e execucao no MediaPipe
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+                # Extracao de metricas geometricas puras
+                landmarks = None
+                frame_metrics: Optional[FrameMetrics] = None
+                if result.face_landmarks and len(result.face_landmarks) > 0:
+                    landmarks = result.face_landmarks[0]
+                    frame_metrics = extract_all_metrics(landmarks, w, h)
+
+                # Processamento temporal e avaliacao de estado do motorista
+                detection = self.detector.update(frame_metrics, now_mono)
+
+                # Disparo de evento sob demanda (exclusivamente quando should_record for True)
+                # Otimizacao Raspberry Pi: codifica o frame puro antes dos overlays, sem frame.copy() continuo
+                if detection.should_record and detection.event_type is not None:
+                    # 1. Codificacao do frame original puro em JPEG em memoria
+                    success, buffer = cv2.imencode(
+                        ".jpg",
+                        frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+                    )
+
+                    if success:
+                        jpeg_bytes = buffer.tobytes()
+                        event_ts = time.time()
+                        event_score = round(detection.score, 2)
+                        self.events_recorded_count += 1
+
+                        # 2. Despacho para o EventManager (se injetado) ou log no terminal
+                        if self.event_manager is not None:
+                            try:
+                                event_id = self.event_manager.record_event(
+                                    type=detection.event_type,
+                                    score=event_score,
+                                    jpeg=jpeg_bytes,
+                                    ts=event_ts,
+                                )
+                                print(
+                                    f"[EVENTO REGISTRADO] ID={event_id} Tipo='{detection.event_type}' "
+                                    f"Score={event_score} Tamanho={len(jpeg_bytes)}B"
+                                )
+                            except Exception as e:
+                                print(f"[ERRO] Falha ao registrar evento no EventManager: {e}", file=sys.stderr)
+                        else:
+                            print(
+                                f"[EVENTO DISPARADO (STANDALONE)] Tipo='{detection.event_type}' "
+                                f"Score={event_score} Tamanho={len(jpeg_bytes)}B Ts={event_ts:.3f}"
+                            )
+
+                        # Ativa o banner visual no modo grafico por 1.5s
+                        alert_banner = (
+                            f"EVENTO DISPARADO: {detection.event_type.upper()} "
+                            f"(Score: {event_score})"
+                        )
+                        alert_banner_expire = now_mono + 1.5
+
+                # Renderizacao visual (somente se nao estiver em modo headless)
+                if not self.headless:
+                    if landmarks is not None:
+                        draw_landmarks(frame, landmarks, w, h)
+
+                    # Limpa banner expirado
+                    if now_mono > alert_banner_expire:
+                        alert_banner = None
+
+                    draw_hud(frame, frame_metrics, detection, fps, alert_banner)
+
+                    cv2.imshow("V-GUARD - Visao Computacional", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        print("[V-GUARD Vision] Encerramento solicitado pelo usuario ('q').")
+                        break
+
+                # Parada opcional por limite de frames (usado em testes automatizados)
+                if self.max_frames is not None and frame_count >= self.max_frames:
+                    break
+
+        finally:
+            cap.release()
+            landmarker.close()
+            if not self.headless:
+                cv2.destroyAllWindows()
+            print(f"[V-GUARD Vision] Pipeline finalizado. Total de frames: {frame_count}, Eventos: {self.events_recorded_count}")
+
+        return self.events_recorded_count
+
+
+# ==============================================================================
+# 3. INTERFACE DE LINHA DE COMANDO (CLI)
+# ==============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="V-GUARD - Modulo de Visao Computacional (Monitoramento de Motorista)"
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Desativa exibicao de janela grafica OpenCV (obrigatorio para execucao headless no Raspberry Pi)",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="0",
+        help="Indice da camera (ex: 0) ou caminho de arquivo de video para testes",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=FRAME_WIDTH,
+        help=f"Largura alvo de captura (padrao: {FRAME_WIDTH})",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=FRAME_HEIGHT,
+        help=f"Altura alvo de captura (padrao: {FRAME_HEIGHT})",
+    )
+    return parser.parse_args()
 
-    # Q para sair
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+
+def main():
+    args = parse_args()
+
+    # Trata indice numerico de camera vs arquivo de video
+    source: Union[int, str] = int(args.source) if args.source.isdigit() else args.source
+
+    pipeline = VisionPipeline(
+        event_manager=None,
+        headless=args.headless,
+        source=source,
+        frame_width=args.width,
+        frame_height=args.height,
+    )
+    pipeline.run()
 
 
-# ============================================================
-# FINALIZAÇÃO
-# ============================================================
-
-cap.release()
-
-cv2.destroyAllWindows()
-
-landmarker.close()
+if __name__ == "__main__":
+    main()

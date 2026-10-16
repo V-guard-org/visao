@@ -32,15 +32,21 @@ python3 --version
 ```
 edge/vguard/vision/
 │
-├── main.py
-├── requirements.txt
-├── README.md
+├── config.py                       # Constantes, índices MediaPipe, modelo 3D canônico e limiares
+├── metrics.py                      # Funções matemáticas puras (EAR, MAR em pixels e solvePnP)
+├── detector.py                     # Análise temporal, máquina de estados, histerese e cooldown
+├── main.py                         # Orquestrador do pipeline (suporte a GUI e modo headless)
+├── test_metrics.py                 # Testes unitários de EAR, MAR, Head Pose e aspect ratio
+├── test_detector.py                # Testes de validação temporal do detector
+├── test_pipeline_integration.py    # Teste de integração end-to-end com Mock do EventManager
+├── requirements.txt                # Dependências do módulo
+├── README.md                       # Documentação do módulo
 │
 ├── scripts/
-│   └── download_model.py
+│   └── download_model.py           # Utilitário para download do modelo MediaPipe
 │
 └── models/
-    └── face_landmarker.task
+    └── face_landmarker.task        # Modelo do MediaPipe Face Landmarker
 ```
 
 ### Para executá-lo:
@@ -77,7 +83,7 @@ Linux
 source .venv/bin/activate
 ```
 
-Após a ativação, o terminal deverá indicar o ambiente .venv ativo.
+Após a ativação, o terminal deverá indicar o ambiente `.venv` ativo.
 
 #### 3. Atualizar o pip
 ```bash
@@ -106,75 +112,63 @@ python scripts/download_model.py
 
 O script criará o diretório `models/` e fará o download do modelo oficial do MediaPipe.
 
-Estrutura esperada:
-```
-edge/vguard/vision/
-│
-├── main.py
-├── requirements.txt
-├── README.md
-│
-├── scripts/
-│   └── download_model.py
-│
-└── models/
-    └── face_landmarker.task
-```
-#### 6. Executar
+#### 6. Executar o Pipeline
 
 Com o ambiente virtual ativado:
+
+**Modo com Interface Gráfica / Depuração:**
 ```bash
 python main.py
 ```
-O programa deverá abrir a webcam e mostrar a detecção facial.
-```
-Pressione:
+O programa abrirá a webcam e exibirá o overlay com EAR, MAR, Head Pose, Estado e FPS.
+Pressione **Q** para encerrar.
 
-Q
-
-para encerrar a execução.
+**Modo Headless (Sem interface gráfica — recomendado para Raspberry Pi):**
+```bash
+python main.py --headless
 ```
-#### 7. O que a versão inicial faz
 
-O pipeline atual é:
+**Executar a partir de arquivo de vídeo gravado:**
+```bash
+python main.py --source video_teste.mp4
 ```
-Câmera
+
+#### 7. Testes Automatizados
+
+O módulo conta com testes determinísticos independentes:
+
+```bash
+# 1. Teste de métricas puras (EAR, MAR e solvePnP em pixels):
+python test_metrics.py
+
+# 2. Teste temporal do detector (histerese, debounce e estados):
+python test_detector.py
+
+# 3. Teste de integração ponta a ponta com Mock do EventManager:
+python test_pipeline_integration.py
+```
+
+#### 8. Arquitetura do Pipeline
+
+```
+Câmera (640x480)
    ↓
-MediaPipe Face Landmarker
+MediaPipe Face Landmarker (timestamps monotônicos reais)
    ↓
-Landmarks faciais
+Landmarks Faciais (478 pontos)
    ↓
-EAR ─────────┐
-             │
-MAR ─────────┼──→ Análise do estado do motorista
-             │
-Head Pose ───┘
+metrics.py (EAR + MAR desnormalizados em pixels + solvePnP)
+   ↓
+detector.py (Análise temporal, histerese 0.15s, cooldown 5.0s)
+   ↓
+EventManager.record_event(type, score, jpeg, ts) [codificação sob demanda]
 ```
 
-O EAR é utilizado para analisar a abertura dos olhos.
+- **EAR**: abertura ocular média com correção de aspecto em pixels.
+- **MAR**: abertura bucal para detecção de bocejos sustentados (diferenciando de fala).
+- **Head Pose (solvePnP + RQDecomp3x3)**: Pitch, Yaw e Roll estáveis em graus para análise de distração.
+- **Integração V-GUARD**: quando `detection.should_record` for `True`, o frame limpo é codificado em JPEG sob demanda e encaminhado ao `EventManager` com `score` de severidade contínua.
 
-O MAR é utilizado para analisar a abertura da boca.
-
-A orientação da cabeça será utilizada para obter:
-
-Yaw
-Pitch
-Roll
-
-Essas métricas serão posteriormente combinadas com análise temporal para identificar possíveis estados relacionados à fadiga e distração.
-
-#### 8. Próximas etapas
-
-A implementação será desenvolvida incrementalmente:
-
-Detecção facial e landmarks
-Cálculo do EAR
-Cálculo do MAR
-Estimativa de Yaw, Pitch e Roll
-Análise temporal
-Classificação do estado do motorista
-Geração de eventos
-Integração com o restante do V-GUARD
 #### 9. Desativar o ambiente virtual
 
 Quando terminar o desenvolvimento:
@@ -182,11 +176,11 @@ Quando terminar o desenvolvimento:
 deactivate
 ```
 Para trabalhar novamente no projeto, basta ativar o ambiente:
-Windows
-```
+Windows:
+```powershell
 .venv\Scripts\Activate.ps1
 ```
-Linux
+Linux:
 ```bash
 source .venv/bin/activate
 ```
