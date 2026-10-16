@@ -38,3 +38,6 @@ logs/
 *.mkv
 *.h264
 *.webm
+
+#configs do editor
+settings.json

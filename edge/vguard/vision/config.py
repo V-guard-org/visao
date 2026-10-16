@@ -97,3 +97,7 @@ PITCH_THRESHOLD: float = 20.0     # Graus de rotação vertical para caracteriza
 EYES_CLOSED_DURATION_S: float = 1.0   # Fechamento contínuo para classificar como sonolência/microssono
 YAWN_DURATION_S: float = 1.5          # Abertura bucal contínua para diferenciar bocejo de fala
 DISTRACTION_DURATION_S: float = 2.0   # Desvio contínuo de rotação para classificar como distração
+
+# Tolerância a ruído e controle de eventos
+GRACE_PERIOD_S: float = 0.15          # Tolerância a ruído ou interrupção breve de sinal
+EVENT_COOLDOWN_S: float = 5.0         # Cooldown mínimo independente entre eventos do mesmo tipo
